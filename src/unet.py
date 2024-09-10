@@ -3,7 +3,7 @@ import torch.nn as nn
 from torchsummary import summary
 
 class Unet(nn.Module):
-    def __init__(self, num_classes=37):
+    def __init__(self, num_classes=1):
         super().__init__()
         self.num_classes = num_classes
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear')
