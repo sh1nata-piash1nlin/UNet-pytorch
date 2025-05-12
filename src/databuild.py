@@ -1,108 +1,95 @@
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset
-import torchmetrics
-from torchmetrics import Dice, JaccardIndex
-import segmentation_models_pytorch as smp
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+import torch
+from torch.utils import data
 import os
-from tqdm import tqdm
-from glob import glob
 
+HERE = os.path.dirname(__file__)
+root = os.path.join(HERE, "..", "data", "lgg-mri-segmentation", "kaggle_3m")
 
-class OxfordIIITPet(Dataset):
-    def __init__(self, root, train=True, transform=None):
-        super().__init__()
-        self.root = root
-        self.transform = transform
-        self.image_path = []
-        self.txt_path = []
+no_mask = 0
+no_mask_files = []
+no_file = 0
+no_files = []
+num_empty_masks = 0
+num_nonempty_masks = 0
 
-        if train:
-            self.txt_path = os.path.join(root, "annotations", "trainval.txt")
+S = 3  # number of pos/neg samples to take
+empty_mask_samples = []
+nonempty_mask_samples = []
+
+img_dimensions = []
+msk_dimensions = []
+
+n_files = 0
+for directory in [os.path.join(root, x) for x in os.listdir(root) if os.path.isdir(os.path.join(root, x))]:
+    for file in os.listdir(directory):
+        n_files += 1
+        img_dimensions.append(np.array(cv2.imread(os.path.join(directory, file))).shape)
+        # count files with no mask
+        if 'mask' not in file:
+            # check if mask exists
+            mask_path = os.path.join(directory, file[:file.find('.tif')] + '_mask.tif')
+            if not os.path.exists(mask_path):
+                no_mask += 1
+                no_mask_files.append(os.path.join(directory, file))
         else:
-            self.txt_path = os.path.join(root, "annotations", "test.txt")
+            msk_dimensions.append(np.array(cv2.imread(os.path.join(directory, file), cv2.IMREAD_UNCHANGED)).shape)
+            # count masks with no file
+            f_path = os.path.join(directory, file[:file.find('mask') - 1] + '.tif')
+            # check if file exists
+            if not os.path.exists(f_path):
+                no_file += 1
+                no_files.append(os.path.join(directory, file))
 
-        with open(self.txt_path) as file_in:
-            for line in file_in:
-                self.image_path.append(line.split(" ")[0])
+            # check if mask is empty
+            j = np.max(cv2.imread(os.path.join(directory, file), cv2.IMREAD_UNCHANGED))
+            if j > 0:
+                num_nonempty_masks += 1
+                if len(nonempty_mask_samples) < S:
+                    nonempty_mask_samples.append(os.path.join(directory, file))
+            else:
+                num_empty_masks += 1
+                if len(empty_mask_samples) < S:
+                    empty_mask_samples.append(os.path.join(directory, file))
+
+file_list = []
+for directory in [os.path.join(root, x) for x in os.listdir(root) if os.path.isdir(os.path.join(root, x))]:
+    for file in os.listdir(directory):
+        # add files to list
+        if 'mask' not in file:
+            result = 0
+            img_path = os.path.join(directory, file)
+            mask_path = os.path.join(directory, file[:file.find('.tif')] + '_mask.tif')
+
+            # check if mask is nonempty
+            if np.max(cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)) > 0:
+                result = 1
+
+            file_list.append([img_path, mask_path, result])
+
+
+class Brain_MRI_Segmentation_Dataset(data.Dataset):
+    def __init__(self, inputs, transform=None):
+        self.inputs = inputs
+        self.transform = transform
+        self.input_dtype = torch.float32
+        self.target_dtype = torch.float32
 
     def __len__(self):
-        return len(self.image_path)
+        return len(self.inputs)
 
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.root, "images", "{}.jpg".format(self.image_path[idx]))
-        mask_path = os.path.join(self.root, "annotations", "trimaps", "{}.png".format(self.image_path[idx]))
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        # fg=1, bg=0, nc=1
-        mask = np.where(mask == 3, 1, np.where(mask == 2, 0, mask)) #binary semantic segmentation
-        transformed_image = []
-        transformed_mask = []
-        if self.transform:
-            transformed = self.transform(image=image, mask=mask)
-            transformed_image = transformed['image']
-            transformed_mask = transformed['mask']
-        return transformed_image, transformed_mask
+    def __getitem__(self, index):
+        # for classification return only the image and the binary label
+        img_path = self.inputs[index][0]
+        mask_path = self.inputs[index][1]
+        # mask_img = cv2.normalize(cv2.imread(mask_path), None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+        mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        x = torch.from_numpy(np.transpose(np.array(cv2.imread(img_path)), (2, 0, 1))).type(self.input_dtype)
+        y = torch.from_numpy(np.resize(np.array(mask_img) / 255., (1, 256, 256))).type(self.target_dtype)
 
-class Visualization(object):        #how training images look like after transforming.
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
+        if self.transform is not None:
+            x = self.transform(x)
+            y = self.transform(y)
 
-    def __call__(self, tensor):
-        for t, m, s in zip(tensor, self.mean, self.std):
-            t.mul_(s).add_(m)
-            return tensor
-
-unorm = Visualization(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-
-if __name__ == "__main__":
-    train_size = 384
-    train_transform = A.Compose([
-        A.Resize(width=train_size, height=train_size),
-        A.HorizontalFlip(p=0.5),
-        A.RandomBrightnessContrast(p=0.2),
-        A.Blur(),
-        A.Sharpen(),
-        A.RGBShift(),
-        A.Cutout(num_holes=5, max_h_size=25, max_w_size=25, fill_value=0),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=55.0), #mean and std of ImageNet
-        ToTensorV2(),
-    ])
-
-    test_transform = A.Compose([
-        A.Resize(width=train_size, height=train_size),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=55.0),
-        ToTensorV2(),
-    ])
-
-    dataset = OxfordIIITPet(root="../data/OxfordIIITPet", train=True, transform=train_transform)
-    img, msk = dataset.__getitem__(10)
-    print(img.shape, msk.shape)
-    # dataloader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True, num_workers=4)
-    # for images, masks in dataloader:
-    #     print(images.shape)
-    #     print(masks.shape)
-    plt.subplot(1,2,1)
-    plt.imshow(unorm(img).permute(1,2,0))
-    plt.subplot(1,2,2)
-    plt.imshow(msk)
-    plt.show()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        return x, y
